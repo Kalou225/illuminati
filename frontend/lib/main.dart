@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'providers/auth_provider.dart';
 import 'screens/auth/login_screen.dart';
 import 'screens/auth/register_screen.dart';
@@ -7,14 +8,16 @@ import 'screens/home/home_screen.dart';
 import 'screens/profile/profile_screen.dart';
 import 'screens/transactions/depot_screen.dart';
 import 'screens/transactions/retrait_screen.dart';
-import 'screens/transactions/history_screen.dart';
+import 'screens/history/history_screen.dart';
 import 'screens/network/network_screen.dart';
 import 'screens/activation/activation_screen.dart';
 import 'screens/grade/grade_upgrade_screen.dart';
 import 'screens/admin/withdrawal_requests_screen.dart';
 import 'screens/referral/referral_screen.dart';
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await SharedPreferences.getInstance();
   runApp(const MyApp());
 }
 

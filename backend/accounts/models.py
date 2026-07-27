@@ -2,6 +2,7 @@ from django.db import models
 from django.contrib.auth.models import AbstractBaseUser, BaseUserManager, PermissionsMixin
 from decimal import Decimal
 
+
 class UserManager(BaseUserManager):
     """Gestionnaire pour créer des utilisateurs et super-utilisateurs."""
     
@@ -51,7 +52,7 @@ class User(AbstractBaseUser, PermissionsMixin):
     phone_number = models.CharField(max_length=15, unique=True, verbose_name="Numéro de téléphone")
     full_name = models.CharField(max_length=100, verbose_name="Nom complet")
     
-    # Grade dans la loge
+    # Grade dans la loge (déterminé par activation_amount)
     grade = models.CharField(
         max_length=20, 
         choices=GRADE_CHOICES, 
@@ -59,24 +60,26 @@ class User(AbstractBaseUser, PermissionsMixin):
         verbose_name="Grade"
     )
     
-    # Activation du compte
+    # Activation du compte (manuellement par l'admin)
     is_activated = models.BooleanField(
         default=False,
         verbose_name="Compte activé"
     )
+    
+    # Solde d'activation (BLOQUÉ À VIE - détermine le grade)
     activation_amount = models.DecimalField(
         max_digits=15, 
         decimal_places=2, 
         default=Decimal('0'),
-        verbose_name="Montant d'activation (bloqué)"
+        verbose_name="Solde d'activation (bloqué à vie)"
     )
     
-    # Compteur de commissions
+    # Solde des commissions (retirable ou utilisable pour montée en grade)
     commission_balance = models.DecimalField(
         max_digits=15, 
         decimal_places=2, 
         default=Decimal('0'),
-        verbose_name="Cumul des commissions"
+        verbose_name="Solde des commissions"
     )
     
     # Commissions en attente (si utilisateur non activé)
@@ -139,24 +142,46 @@ class User(AbstractBaseUser, PermissionsMixin):
             name_prefix = self.full_name.split()[0][:3].upper() if self.full_name else 'USR'
             self.referral_code = f"{name_prefix}-{short_uuid}"
         
-        # NE PAS mettre à jour le grade automatiquement
-        # Le grade est mis à jour uniquement via le bouton "Monter de grade"
+        # METTRE À JOUR LE GRADE AUTOMATIQUEMENT selon le solde d'activation
+        if self.activation_amount > 0:
+            new_grade = self.get_grade_from_activation_balance()
+            if new_grade != self.grade:
+                self.grade = new_grade
         
         super().save(*args, **kwargs)
-    
+        
     def get_commission_percentage(self):
         """Retourne le pourcentage de commission selon le grade."""
-        percentages = {
-            'APPRENTI': Decimal('2'),
-            'COMPAGNON_N3': Decimal('3'),
-            'COMPAGNON_N2': Decimal('4'),
-            'COMPAGNON_N1': Decimal('5'),
-            'MAITRE_N3': Decimal('6'),
-            'MAITRE_N2': Decimal('7'),
-            'MAITRE_N1': Decimal('8'),
-            'GRAND_MAITRE': Decimal('0'),
-        }
-        return percentages.get(self.grade, Decimal('0'))
+        from .grade_constants import COMMISSION_PERCENTAGES
+        return COMMISSION_PERCENTAGES.get(self.grade, Decimal('0'))
+    
+    def get_grade_from_activation_balance(self):
+        """Détermine le grade selon le solde d'activation."""
+        from .grade_constants import GRADE_PLAGE
+        
+        for grade, (min_montant, max_montant) in GRADE_PLAGE.items():
+            if min_montant <= self.activation_amount <= max_montant:
+                return grade
+        return 'APPRENTI'
+    
+    def get_next_grade(self):
+        """Retourne le grade suivant dans la hiérarchie."""
+        grade_order = [
+            'APPRENTI', 'COMPAGNON_N3', 'COMPAGNON_N2', 'COMPAGNON_N1',
+            'MAITRE_N3', 'MAITRE_N2', 'MAITRE_N1', 'GRAND_MAITRE'
+        ]
+        current_index = grade_order.index(self.grade)
+        if current_index < len(grade_order) - 1:
+            return grade_order[current_index + 1]
+        return None
+    
+    def get_minimum_for_next_grade(self):
+        """Retourne le montant minimum requis pour atteindre le grade suivant."""
+        from .grade_constants import GRADE_PLAGE
+        next_grade = self.get_next_grade()
+        if next_grade:
+            return GRADE_PLAGE[next_grade][0]  # Minimum de la plage
+        return None
     
     def get_wallet_total(self):
         """Retourne le total du portefeuille (activation + commissions)."""
@@ -181,27 +206,54 @@ class User(AbstractBaseUser, PermissionsMixin):
         return True
     
     def can_upgrade_grade(self):
-        """Vérifie si l'utilisateur peut monter de grade."""
-        current_grade = self.grade
-        wallet_total = self.get_wallet_total()
-        
-        # Définir les seuils de montée de grade
-        thresholds = {
-            'APPRENTI': Decimal('201000'),  # Vers Compagnon N3
-            'COMPAGNON_N3': Decimal('401000'),  # Vers Compagnon N2
-            'COMPAGNON_N2': Decimal('601000'),  # Vers Compagnon N1
-            'COMPAGNON_N1': Decimal('801000'),  # Vers Maître N3
-            'MAITRE_N3': Decimal('1001000'),  # Vers Maître N2
-            'MAITRE_N2': Decimal('2100000'),  # Vers Maître N1
-            'MAITRE_N1': Decimal('20000000'),  # Vers Grand Maître
-            'GRAND_MAITRE': None,  # Ne peut pas monter plus haut
-        }
-        
-        threshold = thresholds.get(current_grade)
-        if threshold is None:
+        """Vérifie si l'utilisateur peut monter de grade avec ses commissions."""
+        if self.grade == 'GRAND_MAITRE':
             return False
         
-        return wallet_total >= threshold
+        minimum_required = self.get_minimum_for_next_grade()
+        if minimum_required is None:
+            return False
+        
+        # Vérifier si le solde commissions est suffisant
+        return self.commission_balance >= minimum_required
+    
+    def upgrade_grade(self, amount=None):
+        """
+        Monte en grade en utilisant les commissions.
+        
+        Args:
+            amount: Montant à utiliser (par défaut: minimum requis pour le grade suivant)
+        
+        Returns:
+            dict: Informations sur la montée en grade
+        """
+        if not self.can_upgrade_grade():
+            raise ValueError("Vous ne pouvez pas monter de grade actuellement.")
+        
+        next_grade = self.get_next_grade()
+        minimum_required = self.get_minimum_for_next_grade()
+        
+        # Si aucun montant spécifié, utiliser le minimum requis
+        if amount is None:
+            amount = minimum_required
+        elif amount < minimum_required:
+            raise ValueError(f"Le montant minimum pour monter en grade est de {minimum_required} FCFA.")
+        elif amount > self.commission_balance:
+            raise ValueError(f"Solde commissions insuffisant. Disponible: {self.commission_balance} FCFA.")
+        
+        # Effectuer la montée en grade
+        self.commission_balance -= amount
+        self.activation_amount += amount
+        self.grade = next_grade
+        self.save()
+        
+        return {
+            'new_grade': next_grade,
+            'amount_used': amount,
+            'new_activation_balance': self.activation_amount,
+            'new_commission_balance': self.commission_balance,
+            'new_commission_percentage': self.get_commission_percentage(),
+        }
 
     class Meta:
         verbose_name = "Utilisateur"

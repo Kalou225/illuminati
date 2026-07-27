@@ -132,6 +132,7 @@ class ApiService {
         'montant': montant.toString(),
         'moyen_paiement': moyenPaiement,
         'phone_number': phoneNumber,
+        'phone_number_confirm': phoneNumber,
       }),
     );
 
@@ -169,7 +170,7 @@ class ApiService {
     }
   }
 
-  // ============ SOLDE (NOUVEAU) ============
+  // ============ SOLDE ============
 
   static Future<Map<String, dynamic>> getBalance() async {
     final response = await http.get(
@@ -265,6 +266,69 @@ class ApiService {
     } else {
       final error = jsonDecode(response.body);
       throw Exception(error['detail'] ?? 'Erreur lors de la validation');
+    }
+  }
+
+  static Future<Map<String, dynamic>> getNetwork() async {
+    final response = await http.get(
+      Uri.parse('$baseUrl/transactions/network/'),
+      headers: await getAuthHeaders(),
+    );
+
+    print('Network API - Status: ${response.statusCode}');
+    print('Network API - Body: ${response.body}');
+
+    if (response.statusCode == 200) {
+      return jsonDecode(response.body);
+    } else if (response.statusCode == 401) {
+      // Token invalide ou expiré
+      throw Exception('Le type de jeton fourni n\'est pas valide');
+    } else if (response.statusCode == 403) {
+      throw Exception('Accès refusé. Permissions insuffisantes.');
+    } else if (response.statusCode == 500) {
+      throw Exception('Erreur serveur. Veuillez réessayer plus tard.');
+    } else {
+      // Essayer de parser le JSON, sinon retourner un message générique
+      try {
+        final error = jsonDecode(response.body);
+        throw Exception(
+            error['detail'] ?? 'Erreur lors de la récupération du réseau');
+      } catch (e) {
+        throw Exception(
+            'Erreur ${response.statusCode} lors de la récupération du réseau');
+      }
+    }
+  }
+
+  // ============ HISTORIQUE SÉPARÉ ============
+
+  static Future<Map<String, dynamic>> getMesTransactions() async {
+    final response = await http.get(
+      Uri.parse('$baseUrl/transactions/mes-transactions/'),
+      headers: await getAuthHeaders(),
+    );
+
+    if (response.statusCode == 200) {
+      return jsonDecode(response.body);
+    } else if (response.statusCode == 401) {
+      throw Exception('Le type de jeton fourni n\'est pas valide');
+    } else {
+      throw Exception('Erreur lors de la récupération des transactions');
+    }
+  }
+
+  static Future<Map<String, dynamic>> getMesCommissions() async {
+    final response = await http.get(
+      Uri.parse('$baseUrl/transactions/mes-commissions/'),
+      headers: await getAuthHeaders(),
+    );
+
+    if (response.statusCode == 200) {
+      return jsonDecode(response.body);
+    } else if (response.statusCode == 401) {
+      throw Exception('Le type de jeton fourni n\'est pas valide');
+    } else {
+      throw Exception('Erreur lors de la récupération des commissions');
     }
   }
 }

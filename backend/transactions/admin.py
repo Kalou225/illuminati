@@ -1,9 +1,103 @@
-from django.contrib import admin
-from .models import Transaction, DistributionCommission
+from django.contrib import admin, messages
 from django.utils.html import format_html
 from django.urls import reverse
 from django.utils import timezone
 from datetime import timedelta
+from decimal import Decimal
+
+from .models import Transaction, DistributionCommission
+from accounts.models import User
+from accounts.grade_constants import get_grade_display_name
+from transactions.services import CommissionService
+
+
+# ============ ACTIONS POUR LES TRANSACTIONS ============
+
+@admin.action(description='✓ Valider les activations sélectionnées (et distribuer commissions)')
+def validate_activations(modeladmin, request, queryset):
+    """Valide les demandes d'activation, attribue le grade et distribue les commissions."""
+    validated_count = 0
+    
+    for transaction in queryset.filter(statut='EN_ATTENTE', type_transaction='ACTIVATION'):
+        user = transaction.utilisateur
+        
+        # 1. Mettre à jour le solde d'activation et activer le compte
+        user.activation_amount += transaction.montant
+        user.is_activated = True
+        
+        # Le grade sera automatiquement mis à jour par la méthode save() du modèle User
+        user.save()
+        
+        # 2. Valider la transaction
+        transaction.statut = 'VALIDEE'
+        transaction.date_validation = timezone.now()
+        transaction.description = f"Activation validée - Grade: {get_grade_display_name(user.grade)}"
+        transaction.save()
+        
+        # 3. ⭐ DISTRIBUER LES COMMISSIONS AUTOMATIQUEMENT
+        try:
+            commissions = CommissionService.distribuer_commissions(transaction)
+            messages.success(
+                request,
+                f'✅ Activation de {user.full_name} validée. Grade: {get_grade_display_name(user.grade)}. {len(commissions)} commission(s) distribuée(s).'
+            )
+        except Exception as e:
+            messages.error(
+                request,
+                f'⚠️ Activation de {user.full_name} validée, mais erreur distribution commissions: {str(e)}'
+            )
+        
+        validated_count += 1
+    
+    if validated_count == 0:
+        messages.info(request, 'Aucune demande d\'activation en attente à valider.')
+    else:
+        messages.success(request, f'{validated_count} activation(s) traitée(s) avec succès.')
+
+
+@admin.action(description='✗ Rejeter les activations sélectionnées')
+def reject_activations(modeladmin, request, queryset):
+    """Rejette les demandes d'activation."""
+    rejected_count = 0
+    
+    for transaction in queryset.filter(statut='EN_ATTENTE', type_transaction='ACTIVATION'):
+        transaction.statut = 'REJETEE'
+        transaction.date_validation = timezone.now()
+        transaction.save()
+        rejected_count += 1
+    
+    if rejected_count == 0:
+        messages.info(request, 'Aucune demande d\'activation en attente à rejeter.')
+    else:
+        messages.success(request, f'{rejected_count} activation(s) rejetée(s).')
+
+
+@admin.action(description='⏰ Vérifier et rejeter les retraits expirés (>48h)')
+def check_expired_withdrawals(modeladmin, request, queryset):
+    """Marque automatiquement les retraits non validés après 48h."""
+    expired_count = 0
+    for withdrawal in queryset.filter(statut='EN_ATTENTE', type_transaction='RETRAIT'):
+        time_since_request = timezone.now() - withdrawal.date_transaction
+        
+        if time_since_request > timedelta(hours=48):
+            withdrawal.statut = 'REJETEE'
+            withdrawal.description = f"Rejet automatique - Délai de 48h dépassé"
+            withdrawal.save()
+            
+            # Réinitialiser le flag pour permettre à l'utilisateur de refaire une demande
+            user = withdrawal.utilisateur
+            user.withdrawal_requested = False
+            user.save()
+            
+            expired_count += 1
+    
+    if expired_count == 0:
+        messages.info(request, 'Aucun retrait expiré.')
+    else:
+        messages.success(request, f'{expired_count} retrait(s) expiré(s) rejeté(s) automatiquement.')
+
+
+# ============ ADMIN TRANSACTION ============
 
 @admin.register(Transaction)
 class TransactionAdmin(admin.ModelAdmin):
@@ -15,28 +109,29 @@ class TransactionAdmin(admin.ModelAdmin):
         'montant_display',
         'frais_display',
         'montant_net_display',
+        'numero_paiement',  # ⭐ NOUVEAU : Affiche le numéro dans la liste
         'statut_colored',
         'date_transaction',
         'validation_actions',
     ]
-    list_filter = ['type_transaction', 'statut', 'date_transaction']
+    list_filter = ['type_transaction', 'statut', 'date_transaction', 'moyen_paiement'] # ⭐ AJOUT : Filtrer par MTN/Wave/Moov
     search_fields = ['utilisateur__email', 'utilisateur__full_name', 'reference_paiement']
-    readonly_fields = ['date_transaction', 'date_validation']
+    readonly_fields = ['date_transaction', 'date_validation', 'numero_paiement_detail'] # ⭐ AJOUT
     ordering = ['-date_transaction']
     list_per_page = 20
+    actions = [validate_activations, reject_activations, check_expired_withdrawals] # ⭐ AJOUT de l'action 48h
     
     def utilisateur_link(self, obj):
-        """Lien vers l'utilisateur."""
         url = reverse('admin:accounts_user_change', args=[obj.utilisateur.pk])
         return format_html('<a href="{}">{}</a>', url, obj.utilisateur.full_name)
     utilisateur_link.short_description = 'Utilisateur'
     
     def type_transaction_colored(self, obj):
-        """Affichage coloré du type de transaction."""
         colors = {
             'DEPOT': 'green',
             'RETRAIT': 'red',
             'COMMISSION': 'blue',
+            'ACTIVATION': 'purple',
         }
         color = colors.get(obj.type_transaction, 'black')
         return format_html(
@@ -58,8 +153,17 @@ class TransactionAdmin(admin.ModelAdmin):
         return f"{obj.montant_net:,.0f} FCFA"
     montant_net_display.short_description = 'Montant Net'
     
+    # ⭐ NOUVEAU : Affichage du numéro dans la liste
+    def numero_paiement(self, obj):
+        if obj.type_transaction == 'RETRAIT' and obj.reference_paiement:
+            return format_html(
+                '<span style="font-weight: bold; color: #d32f2f; font-size: 14px;">📱 {}</span>',
+                obj.reference_paiement
+            )
+        return '-'
+    numero_paiement.short_description = 'Numéro de Paiement'
+    
     def statut_colored(self, obj):
-        """Affichage coloré du statut."""
         colors = {
             'EN_ATTENTE': 'orange',
             'VALIDEE': 'green',
@@ -74,11 +178,8 @@ class TransactionAdmin(admin.ModelAdmin):
     statut_colored.short_description = 'Statut'
     
     def validation_actions(self, obj):
-        """Boutons de validation pour les retraits en attente."""
         if obj.type_transaction == 'RETRAIT' and obj.statut == 'EN_ATTENTE':
-            # Bouton Valider
             validate_url = reverse('admin:validate-withdrawal', args=[obj.pk, 'approve'])
-            # Bouton Rejeter
             reject_url = reverse('admin:validate-withdrawal', args=[obj.pk, 'reject'])
             
             return format_html(
@@ -96,8 +197,40 @@ class TransactionAdmin(admin.ModelAdmin):
         return '-'
     validation_actions.short_description = 'Actions'
     
+    # ⭐ NOUVEAU : Organisation des champs dans le détail
+    fieldsets = (
+        ('Informations Générales', {
+            'fields': ('utilisateur', 'type_transaction', 'statut', 'description')
+        }),
+        ('Montants', {
+            'fields': ('montant', 'frais', 'montant_net')
+        }),
+        ('Informations de Paiement', {
+            'fields': ('numero_paiement_detail', 'moyen_paiement', 'reference_paiement'),
+            'description': '⚠️ Utilisez ces informations pour effectuer le transfert d\'argent au bénéficiaire.'
+        }),
+        ('Dates et Validation', {
+            'fields': ('date_transaction', 'date_validation')
+        }),
+    )
+    
+    # ⭐ NOUVEAU : Affichage détaillé et coloré du numéro dans la fiche
+    def numero_paiement_detail(self, obj):
+        if obj.type_transaction == 'RETRAIT' and obj.reference_paiement:
+            return format_html(
+                '<div style="background: #ffebee; padding: 20px; border-radius: 8px; border: 2px solid #ef9a9a; margin-bottom: 20px;">'
+                '<strong style="color: #c62828; font-size: 20px;">📱 Numéro pour le transfert : {}</strong><br><br>'
+                '<span style="color: #555; font-size: 15px;">Moyen de paiement : <strong style="color: #333;">{}</strong></span><br>'
+                '<span style="color: #555; font-size: 15px;">Montant net à transférer : <strong style="color: #2e7d32; font-size: 18px;">{} FCFA</strong></span>'
+                '</div>',
+                obj.reference_paiement,
+                obj.get_moyen_paiement_display(),
+                f"{obj.montant_net:,.0f}"
+            )
+        return "Aucun numéro de paiement requis pour cette transaction."
+    numero_paiement_detail.short_description = 'Informations de Paiement (Admin)'
+    
     def get_urls(self):
-        """Ajouter des URLs personnalisées pour la validation."""
         from django.urls import path
         urls = super().get_urls()
         custom_urls = [
@@ -110,8 +243,6 @@ class TransactionAdmin(admin.ModelAdmin):
         return custom_urls + urls
     
     def validate_withdrawal(self, request, pk, action):
-        """Valider ou rejeter un retrait."""
-        from django.contrib import messages
         from django.http import HttpResponseRedirect
         from django.urls import reverse
         
@@ -119,12 +250,10 @@ class TransactionAdmin(admin.ModelAdmin):
             withdrawal = Transaction.objects.get(pk=pk, type_transaction='RETRAIT')
             
             if action == 'approve':
-                # Valider le retrait
                 withdrawal.statut = 'VALIDEE'
                 withdrawal.date_validation = timezone.now()
                 withdrawal.save()
                 
-                # Déduire le montant des commissions
                 user = withdrawal.utilisateur
                 user.commission_balance -= withdrawal.montant
                 user.last_withdrawal_date = timezone.now()
@@ -138,12 +267,10 @@ class TransactionAdmin(admin.ModelAdmin):
                 )
                 
             elif action == 'reject':
-                # Rejeter le retrait
                 withdrawal.statut = 'REJETEE'
                 withdrawal.date_validation = timezone.now()
                 withdrawal.save()
                 
-                # Réinitialiser le flag
                 user = withdrawal.utilisateur
                 user.withdrawal_requested = False
                 user.save()
@@ -161,6 +288,8 @@ class TransactionAdmin(admin.ModelAdmin):
         
         return HttpResponseRedirect(reverse('admin:transactions_transaction_changelist'))
 
+
+# ============ ADMIN DISTRIBUTION COMMISSION ============
 
 @admin.register(DistributionCommission)
 class DistributionCommissionAdmin(admin.ModelAdmin):

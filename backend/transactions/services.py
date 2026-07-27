@@ -7,10 +7,23 @@ from accounts.grade_constants import get_grade_from_amount
 
 
 class CommissionService:
-    """Service pour calculer et distribuer les commissions selon la nouvelle logique."""
+    """Service pour calculer et distribuer les commissions selon la logique dégressive."""
     
-    # Pourcentage réservé à la branche directe (réparti jusqu'au Grand Maître)
+    # Pourcentage réservé à la branche directe
     BRANCH_PERCENTAGE = Decimal('20')
+    
+    # Poids de chaque grade pour la distribution dégressive
+    # Plus le grade est élevé, plus le poids est grand
+    GRADE_WEIGHTS = {
+        'APPRENTI': 1,
+        'COMPAGNON_N3': 2,
+        'COMPAGNON_N2': 3,
+        'COMPAGNON_N1': 4,
+        'MAITRE_N3': 5,
+        'MAITRE_N2': 6,
+        'MAITRE_N1': 7,
+        'GRAND_MAITRE': 0,  # Exclu de la répartition (reçoit le reste)
+    }
     
     @staticmethod
     def _get_commission_percentage(user):
@@ -26,7 +39,7 @@ class CommissionService:
             'MAITRE_N3': Decimal('6'),
             'MAITRE_N2': Decimal('7'),
             'MAITRE_N1': Decimal('8'),
-            'GRAND_MAITRE': Decimal('0'),  # Le GM ne reçoit pas de commission de parrainage direct
+            'GRAND_MAITRE': Decimal('0'),
         }
         return percentages.get(user.grade, Decimal('0'))
     
@@ -36,14 +49,37 @@ class CommissionService:
         return User.objects.filter(grade='GRAND_MAITRE', is_staff=True).first()
     
     @staticmethod
+    def _get_branch_sponsors(user):
+        """
+        Retourne la liste de tous les parrains de la branche directe (du plus proche au plus éloigné).
+        Exclut le Grand Maître.
+        """
+        grand_maitre = CommissionService._get_grand_maitre()
+        sponsors = []
+        current = user
+        
+        while current and current.sponsor:
+            parrain = current.sponsor
+            
+            # Si on atteint le Grand Maître, on s'arrête
+            if parrain == grand_maitre:
+                break
+            
+            sponsors.append(parrain)
+            current = parrain
+        
+        return sponsors
+    
+    @staticmethod
     @transaction.atomic
     def distribuer_commissions(activation_transaction):
         """
-        Distribue les commissions lors de l'activation d'un compte.
+        Distribue les commissions lors d'un dépôt/activation.
         
         Règles :
         - Parrain direct : 2% à 8% selon son grade
-        - Branche directe : 20% réparti jusqu'au Grand Maître
+        - Branche directe : 20% réparti de manière dégressive selon les grades
+          (plus le grade est élevé, plus on reçoit)
         - Reste : au Grand Maître
         - Si parrain non activé : sa part va au Grand Maître
         """
@@ -62,7 +98,7 @@ class CommissionService:
         montant_parrain = (montant * pourcentage_parrain) / Decimal('100')
         
         if parrain_direct and parrain_direct.is_activated:
-            # Ajouter au compteur de commissions du parrain
+            # Ajouter au solde de commissions du parrain
             parrain_direct.commission_balance += montant_parrain
             parrain_direct.save()
             
@@ -76,7 +112,7 @@ class CommissionService:
                 statut='VALIDEE',
                 transaction_originale=activation_transaction,
                 niveau_commission=1,
-                description=f"Commission parrain direct ({pourcentage_parrain}%) sur activation de {utilisateur.full_name}"
+                description=f"Commission parrain direct ({pourcentage_parrain}%) sur dépôt de {utilisateur.full_name}"
             )
             
             commissions_distribuees.append({
@@ -89,84 +125,61 @@ class CommissionService:
             # Parrain non activé → commission va au Grand Maître
             montant_parrain = Decimal('0')
         
-        # 2. Branche directe (20%) - réparti jusqu'au Grand Maître
+        # 2. Branche directe (20%) - répartition dégressive selon les grades
         montant_branche = (montant * CommissionService.BRANCH_PERCENTAGE) / Decimal('100')
         
-        # Parcourir la chaîne de parrainage pour distribuer les 20%
-        utilisateur_actuel = utilisateur
-        niveau = 2
-        montant_restant_branche = montant_branche
+        # Récupérer tous les parrains de la branche (excluant le GM)
+        sponsors_branche = CommissionService._get_branch_sponsors(utilisateur)
         
-        while montant_restant_branche > 0 and utilisateur_actuel and utilisateur_actuel.sponsor:
-            parrain_niveau = utilisateur_actuel.sponsor
+        if sponsors_branche and montant_branche > 0:
+            # Calculer les poids de chaque parrain selon son grade
+            poids_total = 0
+            poids_par_parrain = []
             
-            # Si on atteint le Grand Maître, il prend tout le reste
-            if parrain_niveau == grand_maitre:
-                if parrain_niveau.is_activated:
-                    parrain_niveau.commission_balance += montant_restant_branche
-                    parrain_niveau.save()
+            for sponsor in sponsors_branche:
+                poids = CommissionService.GRADE_WEIGHTS.get(sponsor.grade, 1)
+                poids_par_parrain.append((sponsor, poids))
+                poids_total += poids
+            
+            # Distribuer proportionnellement aux poids
+            for sponsor, poids in poids_par_parrain:
+                if poids_total > 0:
+                    part = (montant_branche * Decimal(poids)) / Decimal(poids_total)
+                else:
+                    part = Decimal('0')
+                
+                if sponsor.is_activated:
+                    sponsor.commission_balance += part
+                    sponsor.save()
                     
                     Transaction.objects.create(
-                        utilisateur=parrain_niveau,
+                        utilisateur=sponsor,
                         type_transaction='COMMISSION',
-                        montant=montant_restant_branche,
+                        montant=part,
                         frais=Decimal('0'),
-                        montant_net=montant_restant_branche,
+                        montant_net=part,
                         statut='VALIDEE',
                         transaction_originale=activation_transaction,
-                        niveau_commission=niveau,
-                        description=f"Commission branche directe (reste) sur activation de {utilisateur.full_name}"
+                        niveau_commission=2,
+                        description=f"Commission branche directe ({sponsor.grade}) sur dépôt de {utilisateur.full_name}"
                     )
                     
                     commissions_distribuees.append({
-                        'beneficiaire': parrain_niveau.full_name,
-                        'montant': float(montant_restant_branche),
-                        'pourcentage': float((montant_restant_branche / montant) * 100),
-                        'type': f'Grand Maître (reste branche)'
+                        'beneficiaire': sponsor.full_name,
+                        'montant': float(part),
+                        'pourcentage': float((part / montant) * 100),
+                        'type': f'Branche directe ({sponsor.grade})'
                     })
-                
-                montant_restant_branche = Decimal('0')
-                break
-            
-            # Distribution égale entre les niveaux de la branche
-            # On compte combien de niveaux jusqu'au GM
-            niveaux_restants = CommissionService._count_levels_to_grand_maitre(parrain_niveau)
-            
-            if niveaux_restants > 0:
-                part_niveau = montant_restant_branche / Decimal(niveaux_restants + 1)
-            else:
-                part_niveau = montant_restant_branche
-            
-            if parrain_niveau.is_activated:
-                parrain_niveau.commission_balance += part_niveau
-                parrain_niveau.save()
-                
-                Transaction.objects.create(
-                    utilisateur=parrain_niveau,
-                    type_transaction='COMMISSION',
-                    montant=part_niveau,
-                    frais=Decimal('0'),
-                    montant_net=part_niveau,
-                    statut='VALIDEE',
-                    transaction_originale=activation_transaction,
-                    niveau_commission=niveau,
-                    description=f"Commission branche directe (niveau {niveau}) sur activation de {utilisateur.full_name}"
-                )
-                
-                commissions_distribuees.append({
-                    'beneficiaire': parrain_niveau.full_name,
-                    'montant': float(part_niveau),
-                    'pourcentage': float((part_niveau / montant) * 100),
-                    'type': f'Branche directe (niveau {niveau})'
-                })
-            
-            montant_restant_branche -= part_niveau
-            utilisateur_actuel = parrain_niveau
-            niveau += 1
+                else:
+                    # Parrain non activé → sa part va au Grand Maître
+                    pass
         
         # 3. Le reste va au Grand Maître
-        total_distribue = montant_parrain + montant_branche
-        montant_reste = montant - total_distribue
+        total_distribue_branche = sum(
+            float(c['montant']) for c in commissions_distribuees 
+            if c['type'].startswith('Branche directe')
+        )
+        montant_reste = montant - montant_parrain - Decimal(str(total_distribue_branche))
         
         if montant_reste > 0 and grand_maitre.is_activated:
             grand_maitre.commission_balance += montant_reste
@@ -181,7 +194,7 @@ class CommissionService:
                 statut='VALIDEE',
                 transaction_originale=activation_transaction,
                 niveau_commission=0,
-                description=f"Commission Grand Maître (reste) sur activation de {utilisateur.full_name}"
+                description=f"Commission Grand Maître (reste) sur dépôt de {utilisateur.full_name}"
             )
             
             commissions_distribuees.append({
@@ -192,19 +205,6 @@ class CommissionService:
             })
         
         return commissions_distribuees
-    
-    @staticmethod
-    def _count_levels_to_grand_maitre(user):
-        """Compte le nombre de niveaux jusqu'au Grand Maître."""
-        grand_maitre = CommissionService._get_grand_maitre()
-        count = 0
-        current = user
-        
-        while current and current.sponsor and current.sponsor != grand_maitre:
-            count += 1
-            current = current.sponsor
-        
-        return count
     
     @staticmethod
     def calculer_frais_retrait(montant):
